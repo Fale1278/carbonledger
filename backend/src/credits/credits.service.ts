@@ -1,6 +1,6 @@
-import { Injectable, NotFoundException, BadRequestException, ConflictException, UnprocessableEntityException, Logger } from "@nestjs/common";
+import { Injectable, NotFoundException, BadRequestException, ConflictException, UnprocessableEntityException, Logger, Inject, forwardRef } from "@nestjs/common";
 import { PrismaService } from "../prisma.service";
-import { MintCreditsDto, RetireCreditsDto } from "./credits.dto";
+import { MintCreditsDto, RetireCreditsDto, BatchOperationResult, BatchItemStatus } from "./credits.dto";
 import { MailService } from "../mail/mail.service";
 import { MailEvent } from "../mail/mail.constants";
 import { IpfsService } from "../common/ipfs.service";
@@ -8,6 +8,8 @@ import { randomBytes } from "crypto";
 import { EventSourcingService } from "../events/event-sourcing.service";
 import { CreditEventType } from "../events/credit-event.types";
 import { WebhookService } from "../webhook/webhook.service";
+import { QueueService } from "../queue/queue.service";
+import { JobType } from "../queue/queue.constants";
 
 /**
  * Serial numbers are stored as fixed-point integers scaled by 100.
@@ -32,6 +34,7 @@ export class CreditsService {
     private readonly ipfsService: IpfsService,
     @Optional() private readonly eventSourcing?: EventSourcingService,
     @Optional() private readonly webhookService?: WebhookService,
+    @Inject(forwardRef(() => QueueService)) private readonly queueService?: QueueService,
   ) {}
 
   async mintCredits(dto: MintCreditsDto, actor?: string) {
@@ -109,6 +112,83 @@ export class CreditsService {
     }
 
     return batch;
+  }
+
+  async bulkMintCredits(dtos: MintCreditsDto[], actor?: string) {
+    const startTime = performance.now();
+    const executionLog = [];
+
+    await this.prisma.$transaction(async (tx) => {
+      for (const dto of dtos) {
+        try {
+          const existing = await tx.creditBatch.findUnique({ where: { batchId: dto.batchId } });
+          if (existing) throw new BadRequestException(`Batch ${dto.batchId} already exists`);
+
+          const serialStartUnits = BigInt(dto.serialStart);
+          const serialEndUnits = BigInt(dto.serialEnd);
+          if (serialStartUnits <= 0n || serialEndUnits <= 0n || serialEndUnits <= serialStartUnits) {
+            throw new BadRequestException("serialEnd must be greater than serialStart and both must be positive");
+          }
+
+          const overlap = await tx.creditBatch.findFirst({
+            where: {
+              OR: [{ serialStart: { lte: dto.serialEnd }, serialEnd: { gte: dto.serialStart } }],
+            },
+          });
+          if (overlap) throw new BadRequestException("Serial number range overlaps existing batch — double counting prevented");
+
+          const batch = await tx.creditBatch.create({ data: dto });
+
+          if (this.eventSourcing) {
+            await this.eventSourcing.recordEvent({
+              creditBatchId: batch.batchId,
+              eventType: CreditEventType.MINT,
+              actor: actor ?? dto.projectId ?? 'system',
+              newState: {
+                batchId: batch.batchId,
+                projectId: batch.projectId,
+                amountAvailable: Number(batch.amount),
+                amountRetired: 0,
+                status: 'Issued',
+                vintageYear: batch.vintageYear,
+                serialStart: batch.serialStart,
+                serialEnd: batch.serialEnd,
+              },
+              txHash: (batch as any).txHash ?? 'STUB_MINT_HASH',
+            }).catch(() => undefined);
+          }
+
+          executionLog.push({ batchId: dto.batchId, status: 'processed' });
+        } catch (error: any) {
+          executionLog.push({ batchId: dto.batchId, status: 'error', error: error.message });
+          throw error; // Re-throw to rollback the entire transaction
+        }
+      }
+    });
+
+    if (this.queueService) {
+      const chunkSize = 25; // chunk operations for BullMQ
+      for (let i = 0; i < dtos.length; i += chunkSize) {
+        const chunk = dtos.slice(i, i + chunkSize);
+        await this.queueService.enqueue(JobType.BULK_MINT, { items: chunk });
+      }
+    }
+
+    const duration = performance.now() - startTime;
+    this.logger.log(`Processed bulk mint of ${dtos.length} items in ${duration.toFixed(2)}ms`);
+
+    return {
+      status: 'success',
+      processed: dtos.length,
+      executionLog,
+      durationMs: duration
+    };
+  }
+
+  async executeBulkMintJob(items: any[]) {
+    this.logger.log(`Executing bulk mint on Stellar for ${items.length} items`);
+    // Placeholder for actual Stellar SDK bulk operations
+    return { status: 'submitted', itemsCount: items.length };
   }
 
   async getBatch(batchId: string) {
@@ -362,4 +442,227 @@ export class CreditsService {
         : null,
     };
   }
+
+  async batchMintCredits(dtos: MintCreditsDto[], actor?: string): Promise<BatchOperationResult<any>> {
+    if (!dtos || !Array.isArray(dtos) || dtos.length === 0) {
+      throw new BadRequestException("Batch input must be a non-empty array of items");
+    }
+
+    if (dtos.length > 1000) {
+      throw new BadRequestException("Batch operations are limited to 1,000 items per request");
+    }
+
+    // Check payload internal duplicates
+    const batchIdSet = new Set<string>();
+    for (const dto of dtos) {
+      if (batchIdSet.has(dto.batchId)) {
+        throw new BadRequestException(`Duplicate batchId ${dto.batchId} found within the batch payload`);
+      }
+      batchIdSet.add(dto.batchId);
+    }
+
+    // Set-based pre-validations
+    const batchIds = dtos.map((d) => d.batchId);
+    const existingBatches = await this.prisma.creditBatch.findMany({
+      where: { batchId: { in: batchIds } },
+      select: { batchId: true },
+    });
+    if (existingBatches.length > 0) {
+      const existingIds = existingBatches.map((b) => b.batchId).join(", ");
+      throw new BadRequestException(`Batch ID(s) already exist: ${existingIds}`);
+    }
+
+    // Serial validation & format checks
+    for (const dto of dtos) {
+      if (!/^[0-9]+$/.test(dto.serialStart) || !/^[0-9]+$/.test(dto.serialEnd)) {
+        throw new BadRequestException(`Invalid serial numbers for batch ${dto.batchId}: must be positive integer strings`);
+      }
+      const start = BigInt(dto.serialStart);
+      const end = BigInt(dto.serialEnd);
+      if (start <= 0n || end <= 0n || end <= start) {
+        throw new BadRequestException(`Invalid serial range for batch ${dto.batchId}: serialEnd must be greater than serialStart`);
+      }
+    }
+
+    // Bulk overlap check
+    const overlaps = await this.prisma.creditBatch.findMany({
+      where: {
+        OR: dtos.map((dto) => ({
+          serialStart: { lte: dto.serialEnd },
+          serialEnd: { gte: dto.serialStart },
+        })),
+      },
+      select: { batchId: true, serialStart: true, serialEnd: true },
+    });
+    if (overlaps.length > 0) {
+      throw new BadRequestException("Serial number range overlaps existing batch(es) — double counting prevented");
+    }
+
+    // Atomic transaction: all or nothing
+    const createdBatches = await this.prisma.$transaction(async (tx) => {
+      await tx.creditBatch.createMany({
+        data: dtos.map((dto) => ({
+          batchId: dto.batchId,
+          projectId: dto.projectId,
+          vintageYear: dto.vintageYear,
+          amount: dto.amount,
+          serialStart: dto.serialStart,
+          serialEnd: dto.serialEnd,
+          metadataCid: dto.metadataCid,
+          status: "Active",
+        })),
+      });
+
+      return tx.creditBatch.findMany({
+        where: { batchId: { in: batchIds } },
+      });
+    });
+
+    const createdMap = new Map<string, any>((createdBatches as any[]).map((b: any) => [b.batchId, b]));
+
+    // Asynchronous post-transaction side effects
+    for (const dto of dtos) {
+      const batch = createdMap.get(dto.batchId);
+      if (!batch) continue;
+
+      if (this.eventSourcing) {
+        this.eventSourcing
+          .recordEvent({
+            creditBatchId: batch.batchId,
+            eventType: CreditEventType.MINT,
+            actor: actor ?? dto.projectId ?? "system",
+            newState: {
+              batchId: batch.batchId,
+              projectId: batch.projectId,
+              amountAvailable: Number(batch.amount),
+              amountRetired: 0,
+              status: "Issued",
+              vintageYear: batch.vintageYear,
+              serialStart: batch.serialStart,
+              serialEnd: batch.serialEnd,
+            },
+            txHash: (batch as any).txHash ?? "STUB_MINT_HASH",
+          })
+          .catch(() => undefined);
+      }
+
+      if (this.webhookService) {
+        this.webhookService
+          .dispatch("credits.minted", {
+            batchId: batch.batchId,
+            projectId: batch.projectId,
+            amount: Number(batch.amount),
+            vintageYear: batch.vintageYear,
+            serialStart: batch.serialStart,
+            serialEnd: batch.serialEnd,
+            timestamp: new Date().toISOString(),
+          })
+          .catch(() => undefined);
+      }
+    }
+
+    const results: BatchItemStatus[] = dtos.map((dto, idx) => ({
+      index: idx,
+      status: "success",
+      itemIdentifier: dto.batchId,
+      data: createdMap.get(dto.batchId) ?? dto,
+    }));
+
+    return {
+      success: true,
+      totalProcessed: dtos.length,
+      successCount: dtos.length,
+      errorCount: 0,
+      results,
+    };
+  }
+
+  async batchRetireCredits(dtos: RetireCreditsDto[]): Promise<BatchOperationResult<any>> {
+    if (!dtos || !Array.isArray(dtos) || dtos.length === 0) {
+      throw new BadRequestException("Batch input must be a non-empty array of items");
+    }
+
+    if (dtos.length > 1000) {
+      throw new BadRequestException("Batch operations are limited to 1,000 items per request");
+    }
+
+    const batchIds = dtos.map((d) => d.batchId);
+    const batches = await this.prisma.creditBatch.findMany({
+      where: { batchId: { in: batchIds } },
+    });
+    const batchMap = new Map<string, any>((batches as any[]).map((b: any) => [b.batchId, b]));
+
+    for (const dto of dtos) {
+      const batch = batchMap.get(dto.batchId);
+      if (!batch) {
+        throw new NotFoundException(`Batch ${dto.batchId} not found`);
+      }
+      if (batch.status === "FullyRetired") {
+        throw new ConflictException(`Batch ${dto.batchId} credits are already fully retired`);
+      }
+      if (dto.amount > Number(batch.amount)) {
+        throw new UnprocessableEntityException(`Cannot retire ${dto.amount} tCO₂e from batch ${dto.batchId} — only ${batch.amount} tCO₂e available`);
+      }
+    }
+
+    const retirementRecords = await this.prisma.$transaction(async (tx) => {
+      const records = [];
+      for (const dto of dtos) {
+        const batch = batchMap.get(dto.batchId)!;
+        const retirementId = `ret-${dto.batchId}-${Date.now()}-${randomBytes(4).toString("hex")}`;
+        const serialStartUnits = BigInt(batch.serialStart);
+        const retireUnits = toSerialUnits(dto.amount);
+        const serialNumbers = Array.from({ length: Number(retireUnits) }, (_, i) =>
+          String(serialStartUnits + BigInt(i))
+        );
+
+        const retirement = await tx.retirementRecord.create({
+          data: {
+            retirementId,
+            batchId: dto.batchId,
+            projectId: batch.projectId,
+            amount: dto.amount,
+            retiredBy: dto.holderPublicKey,
+            beneficiary: dto.beneficiary,
+            retirementReason: dto.retirementReason,
+            vintageYear: batch.vintageYear,
+            serialNumbers,
+            txHash: randomBytes(32).toString("hex"),
+            isValid: true,
+          },
+        });
+
+        const batchAmount = Number(batch.amount);
+        const newStatus = dto.amount >= batchAmount ? "FullyRetired" : "PartiallyRetired";
+        await tx.creditBatch.update({
+          where: { batchId: dto.batchId },
+          data: { status: newStatus },
+        });
+
+        await tx.carbonProject.update({
+          where: { projectId: batch.projectId },
+          data: { totalCreditsRetired: { increment: dto.amount } },
+        });
+
+        records.push(retirement);
+      }
+      return records;
+    });
+
+    const results: BatchItemStatus[] = retirementRecords.map((r, idx) => ({
+      index: idx,
+      status: "success",
+      itemIdentifier: r.retirementId,
+      data: r,
+    }));
+
+    return {
+      success: true,
+      totalProcessed: dtos.length,
+      successCount: dtos.length,
+      errorCount: 0,
+      results,
+    };
+  }
 }
+
