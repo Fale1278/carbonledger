@@ -10,6 +10,8 @@ import cookieParser from 'cookie-parser';
 import { StellarNetworkService } from './common/stellar-network.service';
 import { contractCallsRegistry, poolMetricsRegistry } from './common/metrics.registry';
 import { ValidationExceptionFilter } from './common/validation-exception.filter';
+import { AllExceptionsFilter } from './common/all-exceptions.filter';
+import { LoggerService } from './logger/logger.service';
 
 /**
  * Enhanced JSON logger with correlation ID support.
@@ -19,12 +21,14 @@ import { ValidationExceptionFilter } from './common/validation-exception.filter'
 class JsonLogger extends ConsoleLogger {
   private write(level: string, message: unknown, context?: string): void {
     const correlationId = CorrelationIdContext.getCorrelationId();
+    const traceId = CorrelationIdContext.getTraceId();
     process.stdout.write(
       JSON.stringify({
         timestamp: new Date().toISOString(),
         level,
         service: 'backend',
         correlationId: correlationId || undefined,
+        traceId: traceId || undefined,
         context: context ?? this.context,
         message,
       }) + '\n',
@@ -88,6 +92,15 @@ async function bootstrap() {
 
   // Maps class-validator errors to CarbonLedger validation error catalog format (400 + error codes).
   app.useGlobalFilters(new ValidationExceptionFilter());
+
+  // Catch-all fallback (#966): standardizes every response NOT already handled by a
+  // more specific filter above (ThrottlerExceptionFilter, StellarUnavailableExceptionFilter,
+  // ValidationExceptionFilter) into the CarbonLedger error envelope, and collapses
+  // unexpected 5xx errors to a generic message so internals never leak to callers.
+  // Must be registered LAST — global filters are tried in registration order and this
+  // one's bare @Catch() matches every exception, so anything registered after it would
+  // never run.
+  app.useGlobalFilters(new AllExceptionsFilter(app.get(LoggerService)));
 
   // Fix API6: limit request body to 1 MB to prevent resource exhaustion
   app.use(require('express').json({ limit: '1mb' }));
